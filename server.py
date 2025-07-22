@@ -12,6 +12,22 @@ import tempfile
 from decimal import Decimal, ROUND_HALF_UP
 from sbase_connect import send_to_supabase, supabase  # Import supabase client directly
 
+
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+   CORSMiddleware,
+   allow_origins=[
+       "http://0.0.0.0:7000", 
+       "http://localhost:7000", 
+       "http://127.0.0.1:7000"
+   ],
+   allow_credentials=True,
+   allow_methods=["*"],
+   allow_headers=["*"],
+)
+
 # Add Google Cloud credentials from environment variable
 creds_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
 if creds_json:
