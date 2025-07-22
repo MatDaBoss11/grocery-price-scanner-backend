@@ -8,8 +8,17 @@ import google.generativeai as genai
 import json
 import logging
 import re
+import tempfile
 from decimal import Decimal, ROUND_HALF_UP
 from sbase_connect import send_to_supabase, supabase  # Import supabase client directly
+
+# Add Google Cloud credentials from environment variable
+creds_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+if creds_json:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(json.loads(creds_json), f)
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = f.name
+    print("Google Cloud credentials loaded from environment variable")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -358,4 +367,4 @@ If any field can't be identified confidently, return an empty string \"\". Do no
             
     except Exception as e:
         logger.error(f"Error in call_gemini_api: {e}")
-        raise HTTPException(status_code=502, detail=f"Gemini API error: {str(e)}") 
+        raise HTTPException(status_code=502, detail=f"Gemini API error: {str(e)}")
