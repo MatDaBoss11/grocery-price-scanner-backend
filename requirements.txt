@@ -9,3 +9,4 @@ pydantic>=2.0.0
 httpx
 rsa==4.9
 idna==3.9
+openai

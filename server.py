@@ -10,7 +10,8 @@ import logging
 import re
 import tempfile
 from decimal import Decimal, ROUND_HALF_UP
-from sbase_connect import send_to_supabase, supabase  # Import supabase client directly
+from sbase_connect import send_to_supabase, supabase, get_categories, update_categories_in_database  # Import supabase client and functions
+from openai_service import openai_service
 
 
 app = FastAPI()
@@ -111,7 +112,16 @@ class ProductData(BaseModel):
     product_name: str
     price: str
     size: str
-    store: str  # Add store field
+    store: str
+    categories: list = []  # Add categories field
+
+
+class ProductCategorizeRequest(BaseModel):
+    product_name: str
+
+
+class ProductCategorizeResponse(BaseModel):
+    category: str
 
 
 @app.post("/process-image")
@@ -153,8 +163,9 @@ async def process_image(
         logger.info(f"Gemini response: {product_data}")
 
         try:
-            # Add empty store field - it will be filled in by the frontend
+            # Add empty store and categories fields - they will be filled in by the frontend
             product_data["store"] = ""
+            product_data["categories"] = []
             print("Successfully done: 6. Sends text back to front end")
             return ProductData(**product_data)
         except Exception as e:
@@ -165,7 +176,8 @@ async def process_image(
                 "product_name": product_data.get("product_name", ""),
                 "price": product_data.get("price", ""),
                 "size": product_data.get("size", ""),
-                "store": ""  # Add empty store field
+                "store": "",  # Add empty store field
+                "categories": []  # Add empty categories field
             }
             print("Successfully done: 6. Sends text back to front end (with partial data)")
             return ProductData(**safe_data)
@@ -203,12 +215,13 @@ async def submit_product(product: ProductData):
                 detail=f"Invalid price format or value too large. Expected format: 'Rs XX,XX' (max 9999,99), got: {product.price}"
             )
         
-        # Send to Supabase
+        # Send to Supabase with categories
         result = send_to_supabase(
             store=product.store,
             price=float(price_decimal),  # Convert to float for JSON serialization
             name=product.product_name,
-            size=product.size
+            size=product.size,
+            categories=product.categories
         )
         
         logger.info(f"Supabase response: {result}")
@@ -232,6 +245,183 @@ async def submit_product(product: ProductData):
     except Exception as e:
         logger.error(f"Error submitting product: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/categorize-product", response_model=ProductCategorizeResponse)
+async def categorize_product(request: ProductCategorizeRequest):
+    """Categorize a product using OpenAI API"""
+    try:
+        logger.info(f"Categorizing product: {request.product_name}")
+        
+        # Get available categories from frontend
+        available_categories = ['dairy', 'liquid', 'wheat', 'meat', 'grown', 'frozen', 'snacks', 'miscellaneous']
+        
+        # Use the OpenAI service to categorize the product
+        category = await openai_service.categorize_product(request.product_name, available_categories)
+        
+        logger.info(f"Product '{request.product_name}' categorized as: {category}")
+        return ProductCategorizeResponse(category=category)
+        
+    except Exception as e:
+        logger.error(f"Error categorizing product '{request.product_name}': {e}")
+        # Always return miscellaneous on error, never fail
+        return ProductCategorizeResponse(category="miscellaneous")
+
+
+@app.get("/debug-openai")
+async def debug_openai():
+    """Comprehensive OpenAI API debugging endpoint"""
+    import os
+    
+    debug_info = {
+        "timestamp": "2025-01-13",
+        "credentials_status": {},
+        "api_tests": {},
+        "recommendations": []
+    }
+    
+    try:
+        # Check credentials
+        api_key = os.getenv("OPENAI_API_KEY")
+        
+        debug_info["credentials_status"] = {
+            "api_key_present": bool(api_key),
+            "api_key_length": len(api_key) if api_key else 0,
+            "api_key_preview": api_key[:8] + "..." if api_key and len(api_key) > 8 else "NOT_SET"
+        }
+        
+        if not api_key:
+            debug_info["recommendations"].append("❌ Set OPENAI_API_KEY in .env file")
+            return debug_info
+        
+        # Test categorization
+        logger.info("🔍 Starting OpenAI debug tests...")
+        try:
+            test_products = ["milk", "coca cola", "bread"]
+            test_results = {}
+            
+            for product in test_products:
+                category = await openai_service.categorize_product(product)
+                test_results[product] = {
+                    "category": category,
+                    "is_fallback": category == "miscellaneous"
+                }
+            
+            debug_info["api_tests"]["categorization"] = {
+                "success": True,
+                "test_results": test_results,
+                "all_fallback": all(result["is_fallback"] for result in test_results.values())
+            }
+            
+            if debug_info["api_tests"]["categorization"]["all_fallback"]:
+                debug_info["recommendations"].append("❌ All categorizations returned miscellaneous - API may not be working properly")
+            else:
+                debug_info["recommendations"].append("✅ Categorization working correctly!")
+                
+        except Exception as e:
+            debug_info["api_tests"]["categorization"] = {
+                "success": False,
+                "error": str(e)
+            }
+            debug_info["recommendations"].append(f"❌ Categorization test exception: {str(e)}")
+        
+        # Add general recommendations
+        if not debug_info["recommendations"]:
+            debug_info["recommendations"].append("✅ All tests passed! OpenAI API should be working.")
+        
+        debug_info["recommendations"].extend([
+            "💡 Check server logs for detailed error messages",
+            "💡 Verify OpenAI API key is valid and has sufficient credits",
+            "💡 Check OpenAI API status if requests are failing"
+        ])
+        
+        return debug_info
+        
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}")
+        debug_info["error"] = str(e)
+        debug_info["recommendations"].append(f"❌ Debug endpoint failed: {str(e)}")
+        return debug_info
+
+
+@app.get("/test-openai")
+async def test_openai():
+    """Simple OpenAI API connection test"""
+    try:
+        # Test with a simple product
+        test_product = "milk"
+        category = await openai_service.categorize_product(test_product)
+        return {
+            "status": "success" if category != "miscellaneous" else "warning",
+            "message": f"OpenAI API test completed. Product '{test_product}' categorized as: {category}",
+            "test_product": test_product,
+            "test_category": category,
+            "note": "If category is 'miscellaneous', check /debug-openai for detailed analysis"
+        }
+    except Exception as e:
+        logger.error(f"OpenAI API test error: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+
+@app.get("/categories")
+async def get_all_categories():
+    """Get all available categories from the database"""
+    try:
+        categories_result = get_categories()
+        if categories_result["success"]:
+            return {
+                "status": "success",
+                "categories": [cat['name'] for cat in categories_result["data"]]
+            }
+        else:
+            return {
+                "status": "error",
+                "message": categories_result["error"]
+            }
+    except Exception as e:
+        logger.error(f"Error getting categories: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/check-categories")
+async def check_category_migration():
+    """Check if categories need to be updated/migrated"""
+    try:
+        migration_needed = update_categories_in_database()
+        
+        # Get current categories for display
+        categories_result = get_categories()
+        current_categories = []
+        if categories_result["success"]:
+            current_categories = [cat['name'] for cat in categories_result["data"]]
+        
+        expected_categories = [
+            'dairy', 'liquid', 'wheat', 'meat', 'grown', 'frozen', 'snacks', 'miscellaneous'
+        ]
+        
+        missing_categories = [cat for cat in expected_categories if cat not in current_categories]
+        old_categories = [cat for cat in ['vegetables', 'fruits'] if cat in current_categories]
+        
+        return {
+            "status": "success",
+            "current_categories": current_categories,
+            "expected_categories": expected_categories,
+            "missing_categories": missing_categories,
+            "old_categories_to_migrate": old_categories,
+            "migration_sql": [f"INSERT INTO categories (name) VALUES ('{cat}');" for cat in missing_categories],
+            "needs_migration": len(missing_categories) > 0 or len(old_categories) > 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking categories: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 @app.get("/test-supabase")
 async def test_supabase():
