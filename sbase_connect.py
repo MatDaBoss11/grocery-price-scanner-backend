@@ -35,76 +35,18 @@ def verify_table_exists():
         logger.error(f"Error verifying products table: {str(e)}")
         return False
 
-def get_categories() -> dict:
-    """
-    Get all categories from the categories table
-    
-    Returns:
-        dict: Response with success status and categories data
-    """
-    try:
-        result = supabase.table('categories').select("*").execute()
-        
-        if result.data:
-            logger.info(f"✅ Successfully retrieved {len(result.data)} categories")
-            return {"success": True, "data": result.data}
-        else:
-            logger.error("❌ Failed to retrieve categories")
-            return {"success": False, "error": "No categories found"}
-            
-    except Exception as e:
-        logger.error(f"❌ Error retrieving categories: {str(e)}")
-        return {"success": False, "error": str(e)}
 
-def insert_product_categories(product_id: int, category_ids: list) -> dict:
-    """
-    Insert product-category relationships into junction table
-    
-    Args:
-        product_id (int): Product ID from products table
-        category_ids (list): List of category IDs
-        
-    Returns:
-        dict: Response with success status and data/error
-    """
-    try:
-        if not product_id or not category_ids:
-            return {"success": False, "error": "Product ID and category IDs are required"}
-            
-        # Prepare junction table data
-        junction_data = []
-        for category_id in category_ids:
-            junction_data.append({
-                "product_id": product_id,
-                "category_id": category_id
-            })
-        
-        logger.info(f"Inserting {len(junction_data)} product-category relationships")
-        
-        # Insert into junction table
-        result = supabase.table('product_categories').insert(junction_data).execute()
-        
-        if result.data:
-            logger.info(f"✅ Successfully inserted product-category relationships")
-            return {"success": True, "data": result.data}
-        else:
-            logger.error("❌ Failed to insert product-category relationships")
-            return {"success": False, "error": "No data returned"}
-            
-    except Exception as e:
-        logger.error(f"❌ Error inserting product-category relationships: {str(e)}")
-        return {"success": False, "error": str(e)}
 
-def send_to_supabase(store: str, price: float, name: str, size: str, categories: list = None) -> dict:
+def send_to_supabase(store: str, price: float, name: str, size: str, category: str = None) -> dict:
     """
-    Send product data to Supabase database with optional categories
+    Send product data to Supabase database with optional category
     
     Args:
         store (str): Store name (required)
         price (float): Product price (required)
         name (str): Product name (required)
         size (str): Product size (required)
-        categories (list): List of category names (optional)
+        category (str): Category name (optional)
         
     Returns:
         dict: Response with success status and data/error
@@ -119,7 +61,7 @@ def send_to_supabase(store: str, price: float, name: str, size: str, categories:
             return {"success": False, "error": "products table not found in Supabase"}
             
         # Log the data being sent
-        logger.info(f"Sending to Supabase: store={store}, price={price}, name={name}, size={size}, categories={categories}")
+        logger.info(f"Sending to Supabase: store={store}, price={price}, name={name}, size={size}, category={category}")
             
         # Prepare the data
         product_data = {
@@ -127,92 +69,44 @@ def send_to_supabase(store: str, price: float, name: str, size: str, categories:
             "price": float(price),
             "size": size,
             "store": store,
+            "category": category if category else "miscellaneous",
             "created_at": datetime.utcnow().isoformat()  # Add timestamp
         }
         
         logger.info(f"Prepared data: {product_data}")
         
-        # Insert into products table
-        result = supabase.table('products').insert(product_data).execute()
+        # Insert into products table - check if exists first
+        existing_product = supabase.table('products').select('id').eq('product', name).execute()
         
-        if result.data and len(result.data) > 0:
-            product_id = result.data[0]['id']
-            logger.info(f"✅ Successfully inserted product: {name} with ID: {product_id}")
-            
-            # Handle categories if provided
-            if categories:
-                # Get all available categories
-                categories_result = get_categories()
-                if categories_result["success"]:
-                    available_categories = {cat['name']: cat['id'] for cat in categories_result["data"]}
-                    
-                    # Find category IDs for the provided category names
-                    category_ids = []
-                    for category_name in categories:
-                        if category_name in available_categories:
-                            category_ids.append(available_categories[category_name])
-                        else:
-                            logger.warning(f"Category '{category_name}' not found in database")
-                    
-                    # Insert into junction table if we have valid category IDs
-                    if category_ids:
-                        junction_result = insert_product_categories(product_id, category_ids)
-                        if not junction_result["success"]:
-                            logger.error(f"Failed to insert category relationships: {junction_result['error']}")
-            
-            return {"success": True, "data": result.data}
+        if existing_product.data and len(existing_product.data) > 0:
+            # Product exists, update it
+            product_id = existing_product.data[0]['id']
+            result = supabase.table('products').update(product_data).eq('id', product_id).execute()
+            logger.info(f"Updated existing product '{name}' with ID: {product_id}")
         else:
-            logger.error(f"❌ Failed to insert: {name}")
-            return {"success": False, "error": "No data returned"}
+            # Product doesn't exist, insert new
+            result = supabase.table('products').insert(product_data).execute()
+            if result.data and len(result.data) > 0:
+                product_id = result.data[0]['id']
+                logger.info(f"Inserted new product '{name}' with ID: {product_id}")
+            else:
+                logger.error(f"Failed to insert new product '{name}' - no data returned")
+                return {"success": False, "error": "Failed to insert product - no data returned"}
+        
+        # Check if we got a product_id from either update or insert
+        if 'product_id' in locals():
+            logger.info(f"✅ Successfully processed product: {name} with ID: {product_id} and category: {category}")
+            return {"success": True, "data": result.data if result.data else [{"id": product_id}]}
+        else:
+            logger.error(f"❌ Failed to process: {name}")
+            return {"success": False, "error": "Failed to process product"}
             
     except Exception as e:
         logger.error(f"❌ Error inserting {name}: {str(e)}")
         return {"success": False, "error": str(e)}
 
-def update_categories_in_database():
-    """
-    Helper function to update/migrate category data in Supabase
-    Note: This should be run when the database structure needs to be updated
-    """
-    try:
-        logger.info("Checking for category table updates...")
-        
-        # Expected categories based on new structure
-        expected_categories = [
-            'dairy', 'liquid', 'wheat', 'meat', 'grown', 'frozen', 'snacks', 'miscellaneous'
-        ]
-        
-        # Get current categories
-        categories_result = get_categories()
-        if categories_result["success"]:
-            existing_categories = [cat['name'] for cat in categories_result["data"]]
-            logger.info(f"Existing categories: {existing_categories}")
-            
-            # Check if we need to add new categories
-            missing_categories = [cat for cat in expected_categories if cat not in existing_categories]
-            if missing_categories:
-                logger.info(f"Missing categories that should be added: {missing_categories}")
-                
-                # Note: You'll need to manually add these to your Supabase categories table:
-                for cat in missing_categories:
-                    logger.info(f"  INSERT INTO categories (name) VALUES ('{cat}');")
-            
-            # Check for old categories that need migration
-            old_categories = ['vegetables', 'fruits']
-            found_old = [cat for cat in old_categories if cat in existing_categories]
-            if found_old:
-                logger.info(f"Found old categories that need migration: {found_old}")
-                logger.info("Manual migration needed:")
-                logger.info("  1. Update product_categories entries for 'vegetables' and 'fruits' to 'grown'")
-                logger.info("  2. Remove old 'vegetables' and 'fruits' categories after migration")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error checking categories: {e}")
-        return False
 
-# Verify table exists on module load and check categories
+# Verify table exists on module load
 if not verify_table_exists():
     logger.error("""
     ❌ Products table not found in Supabase!
@@ -221,8 +115,6 @@ if not verify_table_exists():
     - price (float, required)
     - size (text, required)
     - store (text, required)
+    - category (text, optional)
     - created_at (timestamp with timezone, default: now())
     """)
-else:
-    # Check category structure
-    update_categories_in_database()

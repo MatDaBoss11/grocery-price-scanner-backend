@@ -249,3 +249,4 @@ Category:"""
 
 # Global instance
 openai_service = OpenAIService()
+

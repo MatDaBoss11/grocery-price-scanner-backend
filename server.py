@@ -1,16 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 import google.cloud.vision as vision
 import google.generativeai as genai
 import json
 import logging
 import re
 import tempfile
+import decimal
 from decimal import Decimal, ROUND_HALF_UP
-from sbase_connect import send_to_supabase, supabase, get_categories, update_categories_in_database  # Import supabase client and functions
+from sbase_connect import send_to_supabase, supabase  # Import supabase client and functions
 from openai_service import openai_service
 
 
@@ -190,6 +191,248 @@ async def process_image(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.post("/validate-update")
+async def validate_update(product: ProductData):
+    """Validate product data for UPDATE mode before allowing submission"""
+    try:
+        logger.info(f"Validating update for product: {product.dict()}")
+        
+        # Convert price string to decimal for comparison
+        try:
+            # Clean the price string - remove currency symbols, spaces, and keep only digits and decimal separators
+            import re
+            price_str = product.price.strip()
+            
+            # Remove currency symbols and common prefixes
+            price_str = re.sub(r'^(Rs?\.?\s*|R\.?S\.?\s*|R\.?P\.?\s*)', '', price_str, flags=re.IGNORECASE)
+            
+            # Remove any non-digit characters except comma and dot
+            price_str = re.sub(r'[^\d,.]', '', price_str)
+            
+            # Handle comma as decimal separator (common in some formats)
+            if ',' in price_str and '.' not in price_str:
+                # If there's only one comma and it's not at the end, treat it as decimal separator
+                if price_str.count(',') == 1 and not price_str.endswith(','):
+                    price_str = price_str.replace(',', '.')
+                else:
+                    # Multiple commas or comma at end - remove all commas
+                    price_str = price_str.replace(',', '')
+            
+            # Ensure we have a valid decimal string
+            if not price_str or price_str == '.' or price_str == ',':
+                raise ValueError("No valid price found")
+                
+            # Convert to Decimal and round to 2 decimal places
+            price_decimal = Decimal(price_str).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            
+            if price_decimal > Decimal('9999.99'):
+                raise ValueError("Price must be less than 10000.00")
+                
+            logger.info(f"Converted price '{product.price}' to {price_decimal}")
+            
+        except (ValueError, decimal.ConversionSyntax) as e:
+            logger.error(f"Invalid price format: '{product.price}' - Error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid price format. Expected format: 'Rs XX,XX' or 'XX.XX' (max 9999,99), got: '{product.price}'. Please enter a valid price."
+            )
+
+        # Search for similar products in database
+        from difflib import SequenceMatcher
+        
+        # Get all products from database
+        existing_products = supabase.table('products').select('*').execute()
+        
+        if not existing_products.data:
+            raise HTTPException(
+                status_code=400,
+                detail="Product not found in database. Please try adding it instead."
+            )
+        
+        # Find similar products (exact match or very similar titles)
+        similar_products = []
+        product_name_lower = product.product_name.lower().strip()
+        
+        for existing_product in existing_products.data:
+            existing_name_lower = existing_product['product'].lower().strip()
+            
+            # Calculate similarity ratio
+            similarity = SequenceMatcher(None, product_name_lower, existing_name_lower).ratio()
+            
+            # Consider it similar if:
+            # 1. Exact match (similarity = 1.0)
+            # 2. Very similar (similarity >= 0.8) - allows for 1-2 character differences
+            if similarity >= 0.8:
+                similar_products.append({
+                    'product': existing_product,
+                    'similarity': similarity
+                })
+        
+        if not similar_products:
+            raise HTTPException(
+                status_code=400,
+                detail="Product not found in database. Please try adding it instead."
+            )
+        
+        # Find the most similar product
+        best_match = max(similar_products, key=lambda x: x['similarity'])
+        matching_product = best_match['product']
+        
+        logger.info(f"Found matching product: {matching_product['product']} (similarity: {best_match['similarity']:.2f})")
+        
+        # Check if name and price are exactly the same
+        existing_price = Decimal(str(matching_product['price'])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        if best_match['similarity'] == 1.0 and price_decimal == existing_price:
+            raise HTTPException(
+                status_code=400,
+                detail="This product with the same price already exists in the database."
+            )
+        
+        # If name is the same but price is different, check store and category
+        primary_category = product.categories[0] if product.categories else "miscellaneous"
+        
+        if best_match['similarity'] == 1.0 and price_decimal != existing_price:
+            # Check if store and category match
+            if (matching_product['store'] == product.store and 
+                matching_product['category'] == primary_category):
+                # Same name, same store, same category - allow the price update
+                return {
+                    "status": "valid", 
+                    "message": "Product found with different price. Update allowed.",
+                    "existing_product": {
+                        "id": matching_product['id'],
+                        "name": matching_product['product'],
+                        "price": float(existing_price),
+                        "store": matching_product['store'],
+                        "category": matching_product['category']
+                    },
+                    "new_price": float(price_decimal)
+                }
+            else:
+                # Same name but different store or category
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Product '{matching_product['product']}' exists but with different store/category. Expected store: '{matching_product['store']}', category: '{matching_product['category']}'."
+                )
+        
+        # If we get here, name is similar and price is different - allow update
+        return {
+            "status": "valid", 
+            "message": "Similar product found with different price. Update allowed.",
+            "existing_product": {
+                "id": matching_product['id'],
+                "name": matching_product['product'],
+                "price": float(existing_price),
+                "store": matching_product['store'],
+                "category": matching_product['category']
+            },
+            "new_price": float(price_decimal)
+        }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error validating update: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/update-product")
+async def update_product(product: ProductData):
+    """Update existing product in Supabase database - for UPDATE mode only"""
+    try:
+        logger.info(f"Updating existing product: {product.dict()}")
+        
+        # First validate that the product exists and can be updated
+        validation_response = await validate_update(product)
+        
+        if validation_response["status"] != "valid":
+            raise HTTPException(status_code=400, detail="Product validation failed")
+        
+        existing_product_id = validation_response["existing_product"]["id"]
+        
+        # Convert price string to decimal
+        try:
+            import re
+            price_str = product.price.strip()
+            
+            # Remove currency symbols and common prefixes
+            price_str = re.sub(r'^(Rs?\.?\s*|R\.?S\.?\s*|R\.?P\.?\s*)', '', price_str, flags=re.IGNORECASE)
+            
+            # Remove any non-digit characters except comma and dot
+            price_str = re.sub(r'[^\d,.]', '', price_str)
+            
+            # Handle comma as decimal separator (common in some formats)
+            if ',' in price_str and '.' not in price_str:
+                # If there's only one comma and it's not at the end, treat it as decimal separator
+                if price_str.count(',') == 1 and not price_str.endswith(','):
+                    price_str = price_str.replace(',', '.')
+                else:
+                    # Multiple commas or comma at end - remove all commas
+                    price_str = price_str.replace(',', '')
+            
+            # Ensure we have a valid decimal string
+            if not price_str or price_str == '.' or price_str == ',':
+                raise ValueError("No valid price found")
+                
+            # Convert to Decimal and round to 2 decimal places
+            price_decimal = Decimal(price_str).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            
+            if price_decimal > Decimal('9999.99'):
+                raise ValueError("Price must be less than 10000.00")
+                
+            logger.info(f"Converted price '{product.price}' to {price_decimal}")
+            
+        except (ValueError, decimal.ConversionSyntax) as e:
+            logger.error(f"Invalid price format: '{product.price}' - Error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid price format. Expected format: 'Rs XX,XX' or 'XX.XX' (max 9999,99), got: '{product.price}'. Please enter a valid price."
+            )
+        
+        # Update the existing product by ID
+        primary_category = product.categories[0] if product.categories else "miscellaneous"
+        
+        # Use the original product name from database for similar matches
+        # Only use the new name if it's an exact match
+        original_product_name = validation_response["existing_product"]["name"]
+        
+        # Check if this was an exact match or similar match
+        from difflib import SequenceMatcher
+        similarity = SequenceMatcher(None, product.product_name.lower().strip(), original_product_name.lower().strip()).ratio()
+        
+        # Use original name for similar matches (< 1.0), new name only for exact matches (1.0)
+        final_product_name = original_product_name if similarity < 1.0 else product.product_name
+        
+        logger.info(f"Similarity: {similarity:.3f} - Using name: '{final_product_name}' (original: '{original_product_name}', input: '{product.product_name}')")
+        
+        updated_data = {
+            "product": final_product_name,
+            "price": float(price_decimal),
+            "size": product.size,
+            "store": product.store,
+            "category": primary_category,
+        }
+        
+        logger.info(f"Updating product ID {existing_product_id} with data: {updated_data}")
+        
+        result = supabase.table('products').update(updated_data).eq('id', existing_product_id).execute()
+        
+        logger.info(f"Update result: {result}")
+        
+        if result.data:
+            logger.info(f"Successfully updated product ID {existing_product_id}")
+            return {"status": "success", "data": result.data, "message": "Product updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update product - no data returned")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating product: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/submit-product")
 async def submit_product(product: ProductData):
     """Submit product data to Supabase database"""
@@ -198,30 +441,52 @@ async def submit_product(product: ProductData):
         
         # Convert price string (e.g. "Rs 12,50") to decimal
         try:
-            # Remove 'Rs ' and replace comma with dot
-            price_str = product.price.replace("Rs ", "").replace(",", ".")
+            # Clean the price string - remove currency symbols, spaces, and keep only digits and decimal separators
+            import re
+            price_str = product.price.strip()
+            
+            # Remove currency symbols and common prefixes
+            price_str = re.sub(r'^(Rs?\.?\s*|R\.?S\.?\s*|R\.?P\.?\s*)', '', price_str, flags=re.IGNORECASE)
+            
+            # Remove any non-digit characters except comma and dot
+            price_str = re.sub(r'[^\d,.]', '', price_str)
+            
+            # Handle comma as decimal separator (common in some formats)
+            if ',' in price_str and '.' not in price_str:
+                # If there's only one comma and it's not at the end, treat it as decimal separator
+                if price_str.count(',') == 1 and not price_str.endswith(','):
+                    price_str = price_str.replace(',', '.')
+                else:
+                    # Multiple commas or comma at end - remove all commas
+                    price_str = price_str.replace(',', '')
+            
+            # Ensure we have a valid decimal string
+            if not price_str or price_str == '.' or price_str == ',':
+                raise ValueError("No valid price found")
+                
             # Convert to Decimal and round to 2 decimal places
             price_decimal = Decimal(price_str).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             
             if price_decimal > Decimal('9999.99'):
                 raise ValueError("Price must be less than 10000.00")
                 
-            logger.info(f"Converted price {product.price} to {price_decimal}")
+            logger.info(f"Converted price '{product.price}' to {price_decimal}")
             
-        except ValueError as e:
-            logger.error(f"Invalid price format: {product.price}")
+        except (ValueError, decimal.ConversionSyntax) as e:
+            logger.error(f"Invalid price format: '{product.price}' - Error: {e}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid price format or value too large. Expected format: 'Rs XX,XX' (max 9999,99), got: {product.price}"
+                detail=f"Invalid price format. Expected format: 'Rs XX,XX' or 'XX.XX' (max 9999,99), got: '{product.price}'. Please enter a valid price."
             )
         
-        # Send to Supabase with categories
+        # Send to Supabase with categories (will use first category only)
+        primary_category = product.categories[0] if product.categories else "miscellaneous"
         result = send_to_supabase(
             store=product.store,
             price=float(price_decimal),  # Convert to float for JSON serialization
             name=product.product_name,
             size=product.size,
-            categories=product.categories
+            category=primary_category
         )
         
         logger.info(f"Supabase response: {result}")
@@ -244,6 +509,151 @@ async def submit_product(product: ProductData):
         raise
     except Exception as e:
         logger.error(f"Error submitting product: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/add-product")
+async def add_product(
+    product_name: str = Form(...),
+    size: str = Form(...),
+    price: str = Form(...),
+    store: str = Form(...),
+    categories: str = Form(...),
+    product_image: UploadFile = File(...)
+):
+    """Add a new product with image upload to Supabase"""
+    try:
+        logger.info(f"Received add product request: {product_name}, {price}, {size}, {store}")
+        
+        # Parse categories from JSON string
+        try:
+            categories_list = json.loads(categories)
+        except json.JSONDecodeError:
+            categories_list = []
+        
+        # Use first category as primary, fallback to miscellaneous
+        primary_category = categories_list[0] if categories_list else "miscellaneous"
+        logger.info(f"Using primary category: {primary_category} from categories: {categories_list}")
+        
+        # Convert price string (e.g. "Rs 12,50") to decimal
+        try:
+            # Clean the price string - remove currency symbols, spaces, and keep only digits and decimal separators
+            import re
+            price_str = price.strip()
+            
+            # Remove currency symbols and common prefixes
+            price_str = re.sub(r'^(Rs?\.?\s*|R\.?S\.?\s*|R\.?P\.?\s*)', '', price_str, flags=re.IGNORECASE)
+            
+            # Remove any non-digit characters except comma and dot
+            price_str = re.sub(r'[^\d,.]', '', price_str)
+            
+            # Handle comma as decimal separator (common in some formats)
+            if ',' in price_str and '.' not in price_str:
+                # If there's only one comma and it's not at the end, treat it as decimal separator
+                if price_str.count(',') == 1 and not price_str.endswith(','):
+                    price_str = price_str.replace(',', '.')
+                else:
+                    # Multiple commas or comma at end - remove all commas
+                    price_str = price_str.replace(',', '')
+            
+            # Ensure we have a valid decimal string
+            if not price_str or price_str == '.' or price_str == ',':
+                raise ValueError("No valid price found")
+                
+            # Convert to Decimal and round to 2 decimal places
+            price_decimal = Decimal(price_str).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            
+            if price_decimal > Decimal('9999.99'):
+                raise ValueError("Price must be less than 10000.00")
+                
+            logger.info(f"Converted price '{price}' to {price_decimal}")
+            
+        except (ValueError, decimal.InvalidOperation) as e:
+            logger.error(f"Invalid price format: '{price}' - Error: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid price format. Expected format: 'Rs XX,XX' or 'XX.XX' (max 9999,99), got: '{price}'. Please enter a valid price."
+            )
+        
+        # Step 1: Insert product info into products table (without image)
+        product_data = {
+            "product": product_name,
+            "price": float(price_decimal),
+            "size": size,
+            "store": store,
+            "category": primary_category,
+        }
+        
+        logger.info(f"Inserting product: {product_data}")
+        
+        # Insert product and get the ID using the same method as existing code
+        try:
+            # First, try to find if product already exists
+            existing_product = supabase.table('products').select('id').eq('product', product_name).execute()
+            
+            if existing_product.data and len(existing_product.data) > 0:
+                # Product exists, update it
+                product_id = existing_product.data[0]['id']
+                result = supabase.table('products').update(product_data).eq('id', product_id).execute()
+                logger.info(f"Updated existing product with ID: {product_id}")
+            else:
+                # Product doesn't exist, insert new
+                result = supabase.table('products').insert(product_data).execute()
+                if result.data and len(result.data) > 0:
+                    product_id = result.data[0]['id']
+                    logger.info(f"Inserted new product with ID: {product_id}")
+                else:
+                    raise Exception("Failed to insert new product - no ID returned")
+            logger.info(f"Operation result: {result}")
+                    
+        except Exception as e:
+            logger.error(f"Error inserting product: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to insert product: {str(e)}")
+        
+        # Step 2: Upload product image to bucket
+        if product_image.content_type not in SUPPORTED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Unsupported image type: {product_image.content_type}"
+            )
+        
+        image_bytes = await product_image.read()
+        file_name = f"{product_id}.jpg"
+        
+        logger.info(f"Uploading image: {file_name}")
+        
+        # Upload to Supabase storage
+        storage_result = supabase.storage.from_('product-images').upload(
+            file_name, 
+            image_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+        
+        if hasattr(storage_result, 'error') and storage_result.error:
+            logger.error(f"Storage upload error: {storage_result.error}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload image: {storage_result.error}")
+        
+        # Step 3: Update product with image path
+        image_path = f"product-images/{file_name}"
+        update_result = supabase.table('products').update({"images": image_path}).eq('id', product_id).execute()
+        
+        if not update_result.data:
+            logger.warning("Product image path update may have failed")
+        
+        logger.info(f"Product {product_id} updated with image path: {image_path} and category: {primary_category}")
+        
+        return {
+            "status": "success", 
+            "product_id": product_id,
+            "image_path": image_path,
+            "category": primary_category,
+            "categories": categories_list,
+            "message": "Product added successfully with image and category"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding product: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/categorize-product", response_model=ProductCategorizeResponse)
@@ -367,19 +777,14 @@ async def test_openai():
 
 @app.get("/categories")
 async def get_all_categories():
-    """Get all available categories from the database"""
+    """Get all available categories (hardcoded list)"""
     try:
-        categories_result = get_categories()
-        if categories_result["success"]:
-            return {
-                "status": "success",
-                "categories": [cat['name'] for cat in categories_result["data"]]
-            }
-        else:
-            return {
-                "status": "error",
-                "message": categories_result["error"]
-            }
+        # Return the predefined categories
+        categories = ['dairy', 'liquid', 'wheat', 'meat', 'grown', 'frozen', 'snacks', 'miscellaneous']
+        return {
+            "status": "success",
+            "categories": categories
+        }
     except Exception as e:
         logger.error(f"Error getting categories: {e}")
         return {
@@ -387,41 +792,6 @@ async def get_all_categories():
             "message": str(e)
         }
 
-@app.get("/check-categories")
-async def check_category_migration():
-    """Check if categories need to be updated/migrated"""
-    try:
-        migration_needed = update_categories_in_database()
-        
-        # Get current categories for display
-        categories_result = get_categories()
-        current_categories = []
-        if categories_result["success"]:
-            current_categories = [cat['name'] for cat in categories_result["data"]]
-        
-        expected_categories = [
-            'dairy', 'liquid', 'wheat', 'meat', 'grown', 'frozen', 'snacks', 'miscellaneous'
-        ]
-        
-        missing_categories = [cat for cat in expected_categories if cat not in current_categories]
-        old_categories = [cat for cat in ['vegetables', 'fruits'] if cat in current_categories]
-        
-        return {
-            "status": "success",
-            "current_categories": current_categories,
-            "expected_categories": expected_categories,
-            "missing_categories": missing_categories,
-            "old_categories_to_migrate": old_categories,
-            "migration_sql": [f"INSERT INTO categories (name) VALUES ('{cat}');" for cat in missing_categories],
-            "needs_migration": len(missing_categories) > 0 or len(old_categories) > 0
-        }
-        
-    except Exception as e:
-        logger.error(f"Error checking categories: {e}")
-        return {
-            "status": "error",
-            "message": str(e)
-        }
 
 @app.get("/test-supabase")
 async def test_supabase():
@@ -513,13 +883,27 @@ Extract product information from this grocery price tag OCR text and return ONLY
 
 OCR Text: \"{ocr_text}\"
 
-If you find more than one price with Rs, R.S, or R.P, always pick the smallest one. If you see a price, always format it as Rs XX,XX (use a comma as decimal separator).
+IMPORTANT RULES:
+1. If you find more than one price with Rs, R.S, or R.P, always pick the smallest one. If you see a price, always format it as Rs XX,XX (use a comma as decimal separator).
 
-For the product name, use this as a strong hint: \"{filtered['filtered_product_name']}\". The product name should be the longest line of text, in all capital letters, and must not include words like marketing, co, ltd, cdt, &, many numbers, or any manufacturer-like words. Only use this line if it looks like a real product name a customer would say in a store.
+2. For the product name, use this as a strong hint: \"{filtered['filtered_product_name']}\". The product name should be the longest line of text, in all capital letters, and must not include words like marketing, co, ltd, cdt, &, many numbers, or any manufacturer-like words. Only use this line if it looks like a real product name a customer would say in a store.
+
+3. CRITICAL: The product name should NEVER include size information. Extract size information separately and put it in the "size" field. Common size indicators to look for and extract:
+   - Weight: kg, g, lb, oz, etc.
+   - Volume: L, ml, fl oz, etc.
+   - Count: pieces, pcs, units, etc.
+   - Dimensions: cm, inches, etc.
+   - Any numbers followed by units of measurement
+
+4. Examples of proper separation:
+   - "COCA COLA 2L" → product_name: "COCA COLA", size: "2L"
+   - "MILK 1L" → product_name: "MILK", size: "1L"
+   - "BREAD 500G" → product_name: "BREAD", size: "500G"
+   - "CHIPS 100G" → product_name: "CHIPS", size: "100G"
 
 Return format (respond with ONLY valid JSON, no other text):
 {{
-  \"product_name\": \"extracted product name\",
+  \"product_name\": \"extracted product name (without size)\",
   \"price\": \"extracted price with currency\",
   \"size\": \"extracted size/quantity\"
 }}
